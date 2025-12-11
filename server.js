@@ -1,3 +1,6 @@
+// server.js
+// Micro-API para mezclar VIDEO + AUDIO usando FFmpeg en Render
+
 const express = require("express");
 const bodyParser = require("body-parser");
 const ffmpeg = require("fluent-ffmpeg");
@@ -6,96 +9,108 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 
+// Decirle a fluent-ffmpeg dónde está el binario de ffmpeg
 ffmpeg.setFfmpegPath(ffmpegPath);
 
 const app = express();
-app.use(bodyParser.json({ limit: "50mb" }));
+app.use(bodyParser.json({ limit: "50mb" })); // aceptamos JSON grande
 
-// Ruta de prueba rápida: para ver si el servidor está vivo
+// Carpeta temporal (en Render es /tmp)
+const TMP_DIR = os.tmpdir();
+
+// --------- Ruta de prueba rápida (healthcheck) ----------
 app.get("/health", (req, res) => {
   res.send("ok");
 });
 
-// Función para descargar un archivo (video / audio) a un fichero temporal
-async function downloadToFile(url, dest) {
-  const response = await fetch(url); // fetch nativo de Node 18
+// --------- Función para descargar un archivo a disco ----------
+async function downloadToFile(url, destPath) {
+  const response = await fetch(url); // fetch nativo de Node 18 en Render
+
   if (!response.ok) {
-    throw new Error(
-      `Error descargando ${url}: ${response.status} ${response.statusText}`
-    );
+    throw new Error(`Error descargando ${url} – HTTP ${response.status}`);
   }
 
-  const fileStream = fs.createWriteStream(dest);
   await new Promise((resolve, reject) => {
+    const fileStream = fs.createWriteStream(destPath);
     response.body.pipe(fileStream);
     response.body.on("error", reject);
     fileStream.on("finish", resolve);
   });
+
+  return destPath;
 }
 
-// Ruta que mezcla VIDEO + AUDIO
+// --------- Función para mezclar video + audio con FFmpeg ----------
+function mergeVideoAndAudio(videoPath, audioPath, outputPath) {
+  return new Promise((resolve, reject) => {
+    ffmpeg(videoPath)
+      .input(audioPath)
+      // Copiamos el vídeo, re-codificamos el audio y usamos la duración más corta
+      .outputOptions(["-c:v copy", "-c:a aac", "-shortest"])
+      .on("end", () => resolve(outputPath))
+      .on("error", (err) => reject(err))
+      .save(outputPath);
+  });
+}
+
+// --------- Endpoint principal: POST /merge ----------
 app.post("/merge", async (req, res) => {
+  const { video_url, audio_url } = req.body || {};
+
+  if (!video_url || !audio_url) {
+    return res.status(400).json({
+      ok: false,
+      error: "Faltan parámetros. Necesito video_url y audio_url en el body.",
+    });
+  }
+
+  console.log("📥 Petición /merge");
+  console.log("   video_url:", video_url);
+  console.log("   audio_url:", audio_url);
+
+  // Rutas temporales dentro de /tmp
+  const videoPath = path.join(TMP_DIR, `video_${Date.now()}.mp4`);
+  const audioPath = path.join(TMP_DIR, `audio_${Date.now()}.mp3`);
+  const outputPath = path.join(TMP_DIR, `output_${Date.now()}.mp4`);
+
   try {
-    // Aceptamos los dos formatos de nombre, por si acaso:
-    const videoUrl = req.body.video_url || req.body.videoUrl;
-    const audioUrl = req.body.audio_url || req.body.audioUrl;
+    // 1) Descargar archivos al disco del servidor
+    await downloadToFile(video_url, videoPath);
+    await downloadToFile(audio_url, audioPath);
 
-    if (!videoUrl || !audioUrl) {
-      return res
-        .status(400)
-        .json({ error: "Falta video_url o audio_url en el cuerpo de la petición" });
-    }
+    // 2) Mezclar con ffmpeg
+    await mergeVideoAndAudio(videoPath, audioPath, outputPath);
 
-    const tmp = os.tmpdir();
-    const videoPath = path.join(tmp, `video-${Date.now()}.mp4`);
-    const audioPath = path.join(tmp, `audio-${Date.now()}.mp3`);
-    const outPath = path.join(tmp, `out-${Date.now()}.mp4`);
+    console.log("✅ Mezcla completada en", outputPath);
 
-    console.log("Descargando video:", videoUrl);
-    await downloadToFile(videoUrl, videoPath);
-
-    console.log("Descargando audio:", audioUrl);
-    await downloadToFile(audioUrl, audioPath);
-
-    console.log("Lanzando ffmpeg...");
-    await new Promise((resolve, reject) => {
-      ffmpeg(videoPath)
-        .addInput(audioPath)
-        .videoCodec("copy")       // no reencodea el video
-        .audioCodec("aac")        // audio compatible con la mayoría de plataformas
-        .outputOptions("-shortest") // para que no se alargue más que el audio/vídeo
-        .on("end", () => {
-          console.log("FFmpeg terminó OK");
-          resolve();
-        })
-        .on("error", (err) => {
-          console.error("Error en ffmpeg:", err);
-          reject(err);
-        })
-        .save(outPath);
+    // 3) Devolver respuesta a n8n
+    //   De momento solo devolvemos un OK + la ruta local.
+    //   Más adelante, si quieres, lo subimos a Upload.io desde aquí.
+    return res.json({
+      ok: true,
+      message: "Vídeo mezclado correctamente",
+      output_path: outputPath,
     });
-
-    // Devolvemos el vídeo mezclado directamente como archivo
-    res.setHeader("Content-Type", "video/mp4");
-
-    const stream = fs.createReadStream(outPath);
-    stream.on("close", () => {
-      // Limpiar temporales
-      fs.unlink(videoPath, () => {});
-      fs.unlink(audioPath, () => {});
-      fs.unlink(outPath, () => {});
-    });
-    stream.pipe(res);
   } catch (err) {
-    console.error("Error en /merge:", err);
-    res
-      .status(500)
-      .json({ error: "Error procesando el video", detail: err.message });
+    console.error("❌ Error en /merge:", err);
+    return res.status(500).json({
+      ok: false,
+      error: "Error procesando el vídeo con ffmpeg",
+      details: err.message || String(err),
+    });
+  } finally {
+    // Limpieza básica de archivos temporales
+    for (const p of [videoPath, audioPath]) {
+      try {
+        if (fs.existsSync(p)) fs.unlinkSync(p);
+      } catch (_) {}
+    }
   }
 });
 
-// Render te da el puerto en process.env.PORT
-const port = process.env.PORT || 3000;
-app.listen(port, () => {
-  console.log(`Servidor escuchando en puerto ${port}`);
+// --------- Arrancar servidor ----------
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+  console.log(`🚀 Servidor FFmpeg escuchando en puerto ${PORT}`);
 });
