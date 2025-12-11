@@ -1,90 +1,101 @@
-const express = require('express');
-const fetch = require('node-fetch');
-const ffmpeg = require('fluent-ffmpeg');
-const ffmpegPath = require('ffmpeg-static');
-const fs = require('fs');
-const os = require('os');
-const path = require('path');
+const express = require("express");
+const bodyParser = require("body-parser");
+const ffmpeg = require("fluent-ffmpeg");
+const ffmpegPath = require("ffmpeg-static");
+const fs = require("fs");
+const path = require("path");
+const os = require("os");
 
 ffmpeg.setFfmpegPath(ffmpegPath);
 
 const app = express();
-app.use(express.json({ limit: '200mb' }));
+app.use(bodyParser.json({ limit: "50mb" }));
 
-async function downloadFile(url, destPath) {
-  const res = await fetch(url);
-  if (!res.ok) {
-    throw new Error(`Error descargando ${url}: ${res.status} ${res.statusText}`);
+// Ruta de prueba rápida: para ver si el servidor está vivo
+app.get("/health", (req, res) => {
+  res.send("ok");
+});
+
+// Función para descargar un archivo (video / audio) a un fichero temporal
+async function downloadToFile(url, dest) {
+  const response = await fetch(url); // fetch nativo de Node 18
+  if (!response.ok) {
+    throw new Error(
+      `Error descargando ${url}: ${response.status} ${response.statusText}`
+    );
   }
 
-  const fileStream = fs.createWriteStream(destPath);
+  const fileStream = fs.createWriteStream(dest);
   await new Promise((resolve, reject) => {
-    res.body.pipe(fileStream);
-    res.body.on('error', reject);
-    fileStream.on('finish', resolve);
+    response.body.pipe(fileStream);
+    response.body.on("error", reject);
+    fileStream.on("finish", resolve);
   });
 }
 
-app.post('/merge', async (req, res) => {
-  const { video_url, audio_url } = req.body || {};
-
-  if (!video_url || !audio_url) {
-    return res.status(400).json({
-      error: 'Faltan parámetros: video_url y audio_url son obligatorios'
-    });
-  }
-
-  const tmpDir = os.tmpdir();
-  const videoPath = path.join(tmpDir, `video_${Date.now()}.mp4`);
-  const audioPath = path.join(tmpDir, `audio_${Date.now()}.mp3`);
-  const outputPath = path.join(tmpDir, `output_${Date.now()}.mp4`);
-
+// Ruta que mezcla VIDEO + AUDIO
+app.post("/merge", async (req, res) => {
   try {
-    // 1) Descargar archivos
-    await downloadFile(video_url, videoPath);
-    await downloadFile(audio_url, audioPath);
+    // Aceptamos los dos formatos de nombre, por si acaso:
+    const videoUrl = req.body.video_url || req.body.videoUrl;
+    const audioUrl = req.body.audio_url || req.body.audioUrl;
 
-    // 2) Mezclar con FFmpeg
-    ffmpeg(videoPath)
-      .addInput(audioPath)
-      .outputOptions(['-c:v copy', '-c:a aac', '-shortest'])
-      .toFormat('mp4')
-      .on('error', (err) => {
-        console.error('Error en FFmpeg:', err);
-        try {
-          fs.unlinkSync(videoPath);
-          fs.unlinkSync(audioPath);
-          if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
-        } catch (_) {}
-        return res.status(500).json({ error: 'Error procesando el vídeo' });
-      })
-      .on('end', () => {
-        res.setHeader('Content-Type', 'video/mp4');
+    if (!videoUrl || !audioUrl) {
+      return res
+        .status(400)
+        .json({ error: "Falta video_url o audio_url en el cuerpo de la petición" });
+    }
 
-        const stream = fs.createReadStream(outputPath);
-        stream.pipe(res);
+    const tmp = os.tmpdir();
+    const videoPath = path.join(tmp, `video-${Date.now()}.mp4`);
+    const audioPath = path.join(tmp, `audio-${Date.now()}.mp3`);
+    const outPath = path.join(tmp, `out-${Date.now()}.mp4`);
 
-        stream.on('close', () => {
-          try {
-            fs.unlinkSync(videoPath);
-            fs.unlinkSync(audioPath);
-            fs.unlinkSync(outputPath);
-          } catch (_) {}
-        });
-      })
-      .save(outputPath);
+    console.log("Descargando video:", videoUrl);
+    await downloadToFile(videoUrl, videoPath);
+
+    console.log("Descargando audio:", audioUrl);
+    await downloadToFile(audioUrl, audioPath);
+
+    console.log("Lanzando ffmpeg...");
+    await new Promise((resolve, reject) => {
+      ffmpeg(videoPath)
+        .addInput(audioPath)
+        .videoCodec("copy")       // no reencodea el video
+        .audioCodec("aac")        // audio compatible con la mayoría de plataformas
+        .outputOptions("-shortest") // para que no se alargue más que el audio/vídeo
+        .on("end", () => {
+          console.log("FFmpeg terminó OK");
+          resolve();
+        })
+        .on("error", (err) => {
+          console.error("Error en ffmpeg:", err);
+          reject(err);
+        })
+        .save(outPath);
+    });
+
+    // Devolvemos el vídeo mezclado directamente como archivo
+    res.setHeader("Content-Type", "video/mp4");
+
+    const stream = fs.createReadStream(outPath);
+    stream.on("close", () => {
+      // Limpiar temporales
+      fs.unlink(videoPath, () => {});
+      fs.unlink(audioPath, () => {});
+      fs.unlink(outPath, () => {});
+    });
+    stream.pipe(res);
   } catch (err) {
-    console.error('Error en /merge:', err);
-    try {
-      if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
-      if (fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
-      if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
-    } catch (_) {}
-    return res.status(500).json({ error: 'Error interno del servidor' });
+    console.error("Error en /merge:", err);
+    res
+      .status(500)
+      .json({ error: "Error procesando el video", detail: err.message });
   }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`FFmpeg merge API escuchando en puerto ${PORT}`);
+// Render te da el puerto en process.env.PORT
+const port = process.env.PORT || 3000;
+app.listen(port, () => {
+  console.log(`Servidor escuchando en puerto ${port}`);
 });
