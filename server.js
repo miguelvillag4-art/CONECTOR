@@ -1,53 +1,64 @@
 // server.js
-// Micro-API para mezclar VIDEO + AUDIO usando FFmpeg en Render (Node 18+)
+// Micro-API para mezclar VIDEO + AUDIO usando FFmpeg en Render (audio por BASE64 o por URL)
 
 const express = require("express");
+const bodyParser = require("body-parser");
 const ffmpeg = require("fluent-ffmpeg");
 const ffmpegPath = require("ffmpeg-static");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
 
-// Decirle a fluent-ffmpeg dónde está el binario de ffmpeg
 ffmpeg.setFfmpegPath(ffmpegPath);
 
 const app = express();
-app.use(express.json({ limit: "5mb" })); // aquí solo recibimos URLs, no archivos
+app.use(bodyParser.json({ limit: "100mb" })); // subimos el límite por el base64
 
 const TMP_DIR = os.tmpdir();
 
-// Healthcheck
-app.get("/health", (req, res) => {
-  res.status(200).send("ok");
-});
+app.get("/health", (req, res) => res.send("ok"));
 
-// Descarga segura (binario real)
+function safeUrl(u) {
+  if (!u) return u;
+  // Por si llega con "=" al inicio (como te pasó en logs)
+  return String(u).trim().replace(/^=+/, "");
+}
+
 async function downloadToFile(url, destPath) {
-  const cleanUrl = String(url || "").trim();
+  const clean = safeUrl(url);
+  const response = await fetch(clean, { redirect: "follow" });
 
-  const res = await fetch(cleanUrl, { redirect: "follow" });
-  if (!res.ok) {
-    throw new Error(`Error descargando ${cleanUrl} – HTTP ${res.status}`);
+  if (!response.ok) {
+    throw new Error(`Error descargando ${clean} – HTTP ${response.status}`);
   }
 
-  const contentType = res.headers.get("content-type") || "";
-  // Si te devuelve HTML, casi seguro es un 404 “bonito” o página, no un mp3/mp4
-  if (contentType.includes("text/html")) {
-    throw new Error(`La URL devolvió HTML (no archivo). URL: ${cleanUrl}`);
-  }
+  await new Promise((resolve, reject) => {
+    const fileStream = fs.createWriteStream(destPath);
+    response.body.pipe(fileStream);
+    response.body.on("error", reject);
+    fileStream.on("finish", resolve);
+  });
 
-  const arr = await res.arrayBuffer();
-  const buf = Buffer.from(arr);
+  return destPath;
+}
 
-  if (!buf || buf.length < 1000) {
-    throw new Error(`Archivo descargado demasiado pequeño (${buf.length} bytes). URL: ${cleanUrl}`);
+function writeBase64ToFile(base64, destPath) {
+  const clean = String(base64 || "").trim();
+
+  // Por si viene como data:audio/mp3;base64,XXXX
+  const justB64 = clean.includes("base64,") ? clean.split("base64,").pop() : clean;
+
+  const buf = Buffer.from(justB64, "base64");
+
+  if (!buf || buf.length < 5000) {
+    // 5KB mínimo para evitar “basura” como tus 163 bytes
+    throw new Error(`Audio base64 demasiado pequeño (${buf?.length || 0} bytes).`);
   }
 
   fs.writeFileSync(destPath, buf);
   return destPath;
 }
 
-// Merge con ffmpeg
 function mergeVideoAndAudio(videoPath, audioPath, outputPath) {
   return new Promise((resolve, reject) => {
     ffmpeg(videoPath)
@@ -55,7 +66,8 @@ function mergeVideoAndAudio(videoPath, audioPath, outputPath) {
       .outputOptions([
         "-c:v copy",
         "-c:a aac",
-        "-shortest"
+        "-shortest",
+        "-movflags +faststart",
       ])
       .on("end", () => resolve(outputPath))
       .on("error", (err) => reject(err))
@@ -63,58 +75,63 @@ function mergeVideoAndAudio(videoPath, audioPath, outputPath) {
   });
 }
 
-// POST /merge
 app.post("/merge", async (req, res) => {
-  const video_url = String(req.body?.video_url || "").trim();
-  const audio_url = String(req.body?.audio_url || "").trim();
+  const { video_url, audio_url, audio_base64 } = req.body || {};
 
-  if (!video_url || !audio_url) {
-    return res.status(400).json({
-      ok: false,
-      error: "Faltan parámetros. Necesito video_url y audio_url en el body."
-    });
+  const vUrl = safeUrl(video_url);
+  const aUrl = safeUrl(audio_url);
+
+  if (!vUrl) {
+    return res.status(400).json({ ok: false, error: "Falta video_url" });
+  }
+  if (!audio_base64 && !aUrl) {
+    return res.status(400).json({ ok: false, error: "Falta audio_base64 o audio_url" });
   }
 
   console.log("📥 /merge");
-  console.log("video_url:", video_url);
-  console.log("audio_url:", audio_url);
+  console.log("   video_url:", vUrl);
+  console.log("   audio_url:", aUrl ? aUrl : "(no)");
+  console.log("   audio_base64:", audio_base64 ? `(sí, ${String(audio_base64).length} chars)` : "(no)");
 
-  const ts = Date.now();
-  const videoPath = path.join(TMP_DIR, `video_${ts}.mp4`);
-  const audioPath = path.join(TMP_DIR, `audio_${ts}.mp3`);
-  const outputPath = path.join(TMP_DIR, `output_${ts}.mp4`);
+  const videoPath = path.join(TMP_DIR, `video_${Date.now()}.mp4`);
+  const audioPath = path.join(TMP_DIR, `audio_${Date.now()}.mp3`);
+  const outputPath = path.join(TMP_DIR, `output_${Date.now()}.mp4`);
 
   try {
-    await downloadToFile(video_url, videoPath);
-    await downloadToFile(audio_url, audioPath);
+    await downloadToFile(vUrl, videoPath);
+
+    if (audio_base64) {
+      writeBase64ToFile(audio_base64, audioPath);
+    } else {
+      await downloadToFile(aUrl, audioPath);
+      const stats = fs.statSync(audioPath);
+      if (stats.size < 5000) {
+        throw new Error(`Audio descargado demasiado pequeño (${stats.size} bytes). No es un MP3 válido.`);
+      }
+    }
 
     await mergeVideoAndAudio(videoPath, audioPath, outputPath);
 
-    console.log("✅ Merge OK:", outputPath);
+    console.log("✅ Mezcla OK:", outputPath);
 
-    // Devolvemos el archivo como descarga directa (para test rápido)
-    // n8n puede consumirlo si luego haces un HTTP Download de este endpoint (te digo cómo si quieres)
-    return res.status(200).sendFile(outputPath);
+    return res.json({
+      ok: true,
+      message: "Vídeo mezclado correctamente",
+      output_path: outputPath,
+    });
   } catch (err) {
     console.error("❌ Error en /merge:", err);
     return res.status(500).json({
       ok: false,
       error: "Error procesando el vídeo con ffmpeg",
-      details: err.message || String(err)
+      details: err.message || String(err),
     });
   } finally {
-    // limpia inputs (el output no lo borramos en finally porque lo estamos enviando)
     for (const p of [videoPath, audioPath]) {
       try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch (_) {}
     }
-    // borramos el output después de un ratito (evita llenar /tmp)
-    setTimeout(() => {
-      try { if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath); } catch (_) {}
-    }, 60_000);
   }
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log(`🚀 Servidor FFmpeg escuchando en puerto ${PORT}`);
-});
+app.listen(PORT, () => console.log(`🚀 Servidor FFmpeg escuchando en puerto ${PORT}`));
