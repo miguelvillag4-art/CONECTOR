@@ -1,8 +1,7 @@
 // server.js
-// Micro-API para mezclar VIDEO + AUDIO usando FFmpeg en Render
+// Micro-API para mezclar VIDEO + AUDIO usando FFmpeg en Render (Node 18+)
 
 const express = require("express");
-const bodyParser = require("body-parser");
 const ffmpeg = require("fluent-ffmpeg");
 const ffmpegPath = require("ffmpeg-static");
 const fs = require("fs");
@@ -13,103 +12,108 @@ const os = require("os");
 ffmpeg.setFfmpegPath(ffmpegPath);
 
 const app = express();
-app.use(bodyParser.json({ limit: "50mb" })); // aceptamos JSON grande
+app.use(express.json({ limit: "5mb" })); // aquí solo recibimos URLs, no archivos
 
-// Carpeta temporal (en Render es /tmp)
 const TMP_DIR = os.tmpdir();
 
-// --------- Ruta de prueba rápida (healthcheck) ----------
+// Healthcheck
 app.get("/health", (req, res) => {
-  res.send("ok");
+  res.status(200).send("ok");
 });
 
-// --------- Función para descargar un archivo a disco ----------
+// Descarga segura (binario real)
 async function downloadToFile(url, destPath) {
-  const response = await fetch(url); // fetch nativo de Node 18 en Render
+  const cleanUrl = String(url || "").trim();
 
-  if (!response.ok) {
-    throw new Error(`Error descargando ${url} – HTTP ${response.status}`);
+  const res = await fetch(cleanUrl, { redirect: "follow" });
+  if (!res.ok) {
+    throw new Error(`Error descargando ${cleanUrl} – HTTP ${res.status}`);
   }
 
-  await new Promise((resolve, reject) => {
-    const fileStream = fs.createWriteStream(destPath);
-    response.body.pipe(fileStream);
-    response.body.on("error", reject);
-    fileStream.on("finish", resolve);
-  });
+  const contentType = res.headers.get("content-type") || "";
+  // Si te devuelve HTML, casi seguro es un 404 “bonito” o página, no un mp3/mp4
+  if (contentType.includes("text/html")) {
+    throw new Error(`La URL devolvió HTML (no archivo). URL: ${cleanUrl}`);
+  }
 
+  const arr = await res.arrayBuffer();
+  const buf = Buffer.from(arr);
+
+  if (!buf || buf.length < 1000) {
+    throw new Error(`Archivo descargado demasiado pequeño (${buf.length} bytes). URL: ${cleanUrl}`);
+  }
+
+  fs.writeFileSync(destPath, buf);
   return destPath;
 }
 
-// --------- Función para mezclar video + audio con FFmpeg ----------
+// Merge con ffmpeg
 function mergeVideoAndAudio(videoPath, audioPath, outputPath) {
   return new Promise((resolve, reject) => {
     ffmpeg(videoPath)
       .input(audioPath)
-      // Copiamos el vídeo, re-codificamos el audio y usamos la duración más corta
-      .outputOptions(["-c:v copy", "-c:a aac", "-shortest"])
+      .outputOptions([
+        "-c:v copy",
+        "-c:a aac",
+        "-shortest"
+      ])
       .on("end", () => resolve(outputPath))
       .on("error", (err) => reject(err))
       .save(outputPath);
   });
 }
 
-// --------- Endpoint principal: POST /merge ----------
+// POST /merge
 app.post("/merge", async (req, res) => {
-  const { video_url, audio_url } = req.body || {};
+  const video_url = String(req.body?.video_url || "").trim();
+  const audio_url = String(req.body?.audio_url || "").trim();
 
   if (!video_url || !audio_url) {
     return res.status(400).json({
       ok: false,
-      error: "Faltan parámetros. Necesito video_url y audio_url en el body.",
+      error: "Faltan parámetros. Necesito video_url y audio_url en el body."
     });
   }
 
-  console.log("📥 Petición /merge");
-  console.log("   video_url:", video_url);
-  console.log("   audio_url:", audio_url);
+  console.log("📥 /merge");
+  console.log("video_url:", video_url);
+  console.log("audio_url:", audio_url);
 
-  // Rutas temporales dentro de /tmp
-  const videoPath = path.join(TMP_DIR, `video_${Date.now()}.mp4`);
-  const audioPath = path.join(TMP_DIR, `audio_${Date.now()}.mp3`);
-  const outputPath = path.join(TMP_DIR, `output_${Date.now()}.mp4`);
+  const ts = Date.now();
+  const videoPath = path.join(TMP_DIR, `video_${ts}.mp4`);
+  const audioPath = path.join(TMP_DIR, `audio_${ts}.mp3`);
+  const outputPath = path.join(TMP_DIR, `output_${ts}.mp4`);
 
   try {
-    // 1) Descargar archivos al disco del servidor
     await downloadToFile(video_url, videoPath);
     await downloadToFile(audio_url, audioPath);
 
-    // 2) Mezclar con ffmpeg
     await mergeVideoAndAudio(videoPath, audioPath, outputPath);
 
-    console.log("✅ Mezcla completada en", outputPath);
+    console.log("✅ Merge OK:", outputPath);
 
-    // 3) Devolver respuesta a n8n
-    //   De momento solo devolvemos un OK + la ruta local.
-    //   Más adelante, si quieres, lo subimos a Upload.io desde aquí.
-    return res.json({
-      ok: true,
-      message: "Vídeo mezclado correctamente",
-      output_path: outputPath,
-    });
+    // Devolvemos el archivo como descarga directa (para test rápido)
+    // n8n puede consumirlo si luego haces un HTTP Download de este endpoint (te digo cómo si quieres)
+    return res.status(200).sendFile(outputPath);
   } catch (err) {
     console.error("❌ Error en /merge:", err);
     return res.status(500).json({
       ok: false,
       error: "Error procesando el vídeo con ffmpeg",
-      details: err.message || String(err),
+      details: err.message || String(err)
     });
   } finally {
-    // Limpieza básica de archivos temporales
+    // limpia inputs (el output no lo borramos en finally porque lo estamos enviando)
     for (const p of [videoPath, audioPath]) {
-      try {
-        if (fs.existsSync(p)) fs.unlinkSync(p);
-      } catch (_) {}
+      try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch (_) {}
     }
+    // borramos el output después de un ratito (evita llenar /tmp)
+    setTimeout(() => {
+      try { if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath); } catch (_) {}
+    }, 60_000);
   }
 });
 
-// --------- Arrancar servidor ----------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`🚀 Servidor FFmpeg escuchando en puerto ${PORT}`);
