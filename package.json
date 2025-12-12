@@ -9,7 +9,6 @@
     "node": "18.x"
   },
   "dependencies": {
-    "body-parser": "^1.20.3",
     "express": "^4.21.1",
     "fluent-ffmpeg": "^2.1.2",
     "ffmpeg-static": "^5.2.0"
