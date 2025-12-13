@@ -1,16 +1,11 @@
 {
-  "name": "conector-ffmpeg",
-  "version": "1.0.0",
-  "main": "server.js",
+  "name": "ffmpeg-merge",
+  "type": "module",
   "scripts": {
     "start": "node server.js"
   },
-  "engines": {
-    "node": "18.x"
-  },
   "dependencies": {
-    "express": "^4.21.1",
-    "fluent-ffmpeg": "^2.1.2",
-    "ffmpeg-static": "^5.2.0"
+    "express": "^4.19.2",
+    "node-fetch": "^3.3.2"
   }
 }
