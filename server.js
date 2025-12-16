@@ -5,20 +5,38 @@ const fs = require("fs");
 const fsp = require("fs/promises");
 const path = require("path");
 const os = require("os");
+const crypto = require("crypto");
 const { spawn } = require("child_process");
 const ffmpegPath = require("ffmpeg-static");
 
 const app = express();
 
+// IMPORTANTE en Render / proxy
+app.set("trust proxy", 1);
+
 app.use(cors());
-app.use(express.json({ limit: "50mb" })); // sube/baja si tu base64 es muy grande
+app.use(express.json({ limit: "200mb" })); // sube si tu audio_base64 es grande
 
 app.get("/", (_req, res) => {
   res.status(200).send("OK - FFmpeg merge service is live");
 });
 
+// Carpeta temporal para guardar videos servibles por URL
+const STORE_DIR = path.join(os.tmpdir(), "merged-store");
+async function ensureStoreDir() {
+  try {
+    await fsp.mkdir(STORE_DIR, { recursive: true });
+  } catch {}
+}
+ensureStoreDir();
+
+// TTL para links (en ms). 30 min:
+const FILE_TTL_MS = 30 * 60 * 1000;
+
+// Para poder borrar luego
+const timers = new Map();
+
 async function downloadToFile(url, outPath) {
-  // IMPORTANTE: usa arrayBuffer para evitar .pipe
   const resp = await fetch(url, {
     redirect: "follow",
     headers: {
@@ -35,7 +53,6 @@ async function downloadToFile(url, outPath) {
   const ab = await resp.arrayBuffer();
   const buf = Buffer.from(ab);
 
-  // Si te baja 100-300 bytes, casi seguro es HTML/redirect/login, etc.
   if (buf.length < 1024) {
     throw new Error(`Downloaded file too small (${buf.length} bytes). URL: ${url}`);
   }
@@ -45,17 +62,15 @@ async function downloadToFile(url, outPath) {
 }
 
 function writeBase64ToFile(base64Str, outPath) {
-  // Limpia prefijos tipo "data:audio/mp3;base64,"
   const cleaned = base64Str
     .replace(/^data:.*?;base64,/, "")
-    .replace(/\s/g, ""); // quita saltos de línea/espacios
+    .replace(/\s/g, "");
 
   if (!cleaned || cleaned.length < 200) {
     throw new Error("audio_base64 is empty/too short after cleaning");
   }
 
   const buf = Buffer.from(cleaned, "base64");
-
   if (buf.length < 1024) {
     throw new Error(`Decoded audio too small (${buf.length} bytes)`);
   }
@@ -73,70 +88,171 @@ function runFfmpeg(args) {
 
     p.on("close", (code) => {
       if (code === 0) return resolve();
-      reject(new Error(`ffmpeg failed (code ${code}): ${stderr.slice(0, 2000)}`));
+      reject(new Error(`ffmpeg failed (code ${code}): ${stderr.slice(0, 4000)}`));
     });
   });
 }
 
+function getBaseUrl(req) {
+  const proto = req.headers["x-forwarded-proto"] || req.protocol || "https";
+  const host = req.headers["x-forwarded-host"] || req.get("host");
+  return `${proto}://${host}`;
+}
+
+async function buildMergedVideo({ video_url, audio_url, audio_base64 }) {
+  video_url = (video_url || "").toString().trim().replace(/^=+/, "");
+  audio_url = (audio_url || "").toString().trim().replace(/^=+/, "");
+
+  if (!video_url) throw new Error("video_url is required");
+  if (!audio_url && !audio_base64) throw new Error("Provide audio_url OR audio_base64");
+
+  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "merge-"));
+  const inVideo = path.join(tmpDir, "video.mp4");
+  const inAudio = path.join(tmpDir, "audio.mp3");
+  const outVideo = path.join(tmpDir, "out.mp4");
+
+  // 1) bajar video
+  await downloadToFile(video_url, inVideo);
+
+  // 2) audio
+  if (audio_base64) {
+    writeBase64ToFile(audio_base64, inAudio);
+  } else {
+    await downloadToFile(audio_url, inAudio);
+  }
+
+  // 3) merge IG-friendly (RE-ENCODE)
+  await runFfmpeg([
+    "-y",
+    "-i", inVideo,
+    "-i", inAudio,
+
+    "-map", "0:v:0",
+    "-map", "1:a:0",
+
+    // Video IG-friendly
+    "-c:v", "libx264",
+    "-profile:v", "high",
+    "-level", "4.1",
+    "-pix_fmt", "yuv420p",
+    "-r", "30",
+
+    // Audio IG-friendly
+    "-c:a", "aac",
+    "-b:a", "192k",
+    "-ar", "44100",
+    "-ac", "2",
+
+    "-shortest",
+    "-movflags", "+faststart",
+
+    outVideo,
+  ]);
+
+  const stat = await fsp.stat(outVideo);
+  if (stat.size < 1024 * 50) {
+    throw new Error(`Output too small (${stat.size} bytes)`);
+  }
+
+  return { tmpDir, outVideo };
+}
+
+/**
+ * Endpoint A: devuelve BINARIO (para Facebook/YouTube)
+ */
 app.post("/merge", async (req, res) => {
+  let tmpDir = null;
   try {
-    let { video_url, audio_url, audio_base64 } = req.body || {};
-
-    // Evita el bug de URLs con "=" o "\n" adelante
-    video_url = (video_url || "").toString().trim().replace(/^=+/, "");
-    audio_url = (audio_url || "").toString().trim().replace(/^=+/, "");
-
-    if (!video_url) return res.status(400).json({ error: "video_url is required" });
-    if (!audio_url && !audio_base64) {
-      return res.status(400).json({ error: "Provide audio_url OR audio_base64" });
-    }
-
-    const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "merge-"));
-    const inVideo = path.join(tmpDir, "video.mp4");
-    const inAudio = path.join(tmpDir, "audio.mp3");
-    const outVideo = path.join(tmpDir, "out.mp4");
-
-    // 1) bajar video
-    await downloadToFile(video_url, inVideo);
-
-    // 2) audio: base64 (preferido) o url
-    if (audio_base64) {
-      writeBase64ToFile(audio_base64, inAudio);
-    } else {
-      await downloadToFile(audio_url, inAudio);
-    }
-
-    // 3) merge con ffmpeg (reemplaza audio)
-    await runFfmpeg([
-      "-y",
-      "-i", inVideo,
-      "-i", inAudio,
-      "-map", "0:v:0",
-      "-map", "1:a:0",
-      "-c:v", "copy",
-      "-c:a", "aac",
-      "-shortest",
-      outVideo,
-    ]);
-
-    const stat = await fsp.stat(outVideo);
-    if (stat.size < 1024 * 50) {
-      throw new Error(`Output too small (${stat.size} bytes)`);
-    }
+    const { video_url, audio_url, audio_base64 } = req.body || {};
+    const built = await buildMergedVideo({ video_url, audio_url, audio_base64 });
+    tmpDir = built.tmpDir;
 
     res.setHeader("Content-Type", "video/mp4");
     res.setHeader("Content-Disposition", 'attachment; filename="merged.mp4"');
-    fs.createReadStream(outVideo).pipe(res);
+    fs.createReadStream(built.outVideo).pipe(res);
 
-    // Limpieza “best effort”
     res.on("finish", async () => {
       try { await fsp.rm(tmpDir, { recursive: true, force: true }); } catch {}
     });
   } catch (err) {
     console.error("❌ /merge error:", err);
+    if (tmpDir) {
+      try { await fsp.rm(tmpDir, { recursive: true, force: true }); } catch {}
+    }
     res.status(500).json({ error: "Error procesando el video con ffmpeg", details: String(err.message || err) });
   }
 });
 
-const port = process.env.PORT || 10000;
-app.listen(port, () => console.log(`Servidor FFmpeg escuchando en puerto ${port}`));
+/**
+ * Opción B1: devuelve URL pública temporal (para Instagram)
+ * POST /merge_url -> { file_url, id, expires_at }
+ */
+app.post("/merge_url", async (req, res) => {
+  let tmpDir = null;
+  try {
+    const { video_url, audio_url, audio_base64 } = req.body || {};
+    const built = await buildMergedVideo({ video_url, audio_url, audio_base64 });
+    tmpDir = built.tmpDir;
+
+    // Guardamos el outVideo en STORE_DIR con un id
+    const id = crypto.randomBytes(10).toString("hex");
+    const storedPath = path.join(STORE_DIR, `${id}.mp4`);
+    await fsp.copyFile(built.outVideo, storedPath);
+
+    // Limpiamos el tmpDir (ya no lo necesitamos)
+    try { await fsp.rm(tmpDir, { recursive: true, force: true }); } catch {}
+
+    // Programamos borrado por TTL
+    const expiresAt = Date.now() + FILE_TTL_MS;
+    if (timers.has(id)) clearTimeout(timers.get(id));
+
+    const t = setTimeout(async () => {
+      try { await fsp.unlink(storedPath); } catch {}
+      timers.delete(id);
+    }, FILE_TTL_MS);
+
+    timers.set(id, t);
+
+    const baseUrl = getBaseUrl(req);
+    const file_url = `${baseUrl}/files/${id}.mp4`;
+
+    res.json({
+      id,
+      file_url,
+      expires_at: new Date(expiresAt).toISOString(),
+    });
+  } catch (err) {
+    console.error("❌ /merge_url error:", err);
+    if (tmpDir) {
+      try { await fsp.rm(tmpDir, { recursive: true, force: true }); } catch {}
+    }
+    res.status(500).json({ error: "Error creando file_url", details: String(err.message || err) });
+  }
+});
+
+/**
+ * Sirve el MP4 temporal para IG
+ */
+app.get("/files/:id.mp4", async (req, res) => {
+  try {
+    const id = (req.params.id || "").replace(/[^a-f0-9]/gi, "");
+    const filePath = path.join(STORE_DIR, `${id}.mp4`);
+
+    // si no existe
+    await fsp.access(filePath).catch(() => {
+      throw new Error("File not found or expired");
+    });
+
+    res.setHeader("Content-Type", "video/mp4");
+    res.setHeader("Cache-Control", "public, max-age=60"); // cache pequeñita
+    fs.createReadStream(filePath).pipe(res);
+  } catch (err) {
+    res.status(404).json({ error: "Not found", details: String(err.message || err) });
+  }
+});
+
+// Render usa PORT
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+  console.log(`Servidor FFmpeg escuchando en puerto ${PORT}`);
+});
